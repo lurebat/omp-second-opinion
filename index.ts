@@ -11,19 +11,28 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import {
 	buildTranscript,
 	clampThinking,
 	formatModel,
 	hasFinalVerdictLine,
 	modelFamily,
+	mostSevereVerdict,
 	orderCandidates,
 	parseSelectorEffort,
 	parseVerdict,
 	resolveSelector,
 	textFromContent,
 } from "./core";
-import { REVIEWER_SYSTEM_PROMPT, TOOL_DESCRIPTION } from "./prompts";
+import {
+	DEFAULT_FOCUS,
+	FOCUS_PRESETS,
+	REVIEWER_SYSTEM_PROMPT,
+	TOOL_DESCRIPTION,
+} from "./prompts";
+import type { ReviewMode } from "./prompts";
 import type {
 	AgentToolResult,
 	Effort,
@@ -44,10 +53,24 @@ const MAX_AUTO_ATTEMPTS = 4;
 const DEFAULT_REVIEW_TIMEOUT_MS = 180_000;
 const IDLE_WAIT_GRACE_MS = 5_000;
 
+type ReviewScope = "transcript" | "diff" | "both";
+
+interface LastRun {
+	ts: number;
+	reviewer: string;
+	focus: string;
+	scope: ReviewScope;
+	verdict?: string;
+	body: string;
+}
+
 interface ExtensionState {
 	consented?: boolean;
 	reviewer?: string;
 	fingerprint?: string;
+	defaultEffort?: Effort;
+	autoHandoff?: boolean;
+	lastRun?: LastRun;
 }
 
 type ProgressLevel = "info" | "warn" | "error";
@@ -117,8 +140,11 @@ function envDisabled(name: string): boolean {
 	return v === "0" || v === "false" || v === "no" || v === "off";
 }
 
-function commandAutoHandoff(): boolean {
-	return !envDisabled("OMP_SECOND_OPINION_AUTO_HANDOFF");
+function commandAutoHandoff(state: ExtensionState): boolean {
+	if ((process.env.OMP_SECOND_OPINION_AUTO_HANDOFF ?? "").trim() !== "") {
+		return !envDisabled("OMP_SECOND_OPINION_AUTO_HANDOFF");
+	}
+	return state.autoHandoff ?? true;
 }
 
 function envPositiveInt(name: string): number | undefined {
@@ -146,6 +172,44 @@ function formatDuration(ms: number): string {
 	return remainder === 0 ? `${minutes}m` : `${minutes}m ${remainder}s`;
 }
 
+const DIFF_CHAR_BUDGET = 48_000;
+const MAX_PANEL_REVIEWERS = 4;
+
+const execFileAsync = promisify(execFile);
+
+function clampReviewers(value: number | undefined): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) return 1;
+	return Math.min(MAX_PANEL_REVIEWERS, Math.max(1, Math.floor(value)));
+}
+
+/** Run one `git diff` invocation, swallowing any error (missing git / not a repo). */
+async function gitDiff(cwd: string, args: string[]): Promise<string> {
+	try {
+		const { stdout } = await execFileAsync("git", ["--no-pager", "diff", "--no-color", ...args], {
+			cwd,
+			maxBuffer: 16 * 1024 * 1024,
+			windowsHide: true,
+		});
+		return stdout ?? "";
+	} catch {
+		return "";
+	}
+}
+
+/** Collect the working-tree diff (staged + unstaged) for scope=diff/both, truncated to budget. */
+async function collectDiff(cwd: string): Promise<{ text: string; files: number }> {
+	const [staged, unstaged] = await Promise.all([gitDiff(cwd, ["--staged"]), gitDiff(cwd, [])]);
+	const parts: string[] = [];
+	if (staged.trim()) parts.push(`### Staged changes\n${staged.trimEnd()}`);
+	if (unstaged.trim()) parts.push(`### Unstaged changes\n${unstaged.trimEnd()}`);
+	let text = parts.join("\n\n");
+	const files = (text.match(/^diff --git /gm) ?? []).length;
+	if (text.length > DIFF_CHAR_BUDGET) {
+		text = `${text.slice(0, DIFF_CHAR_BUDGET)}\n…[diff truncated to budget]`;
+	}
+	return { text, files };
+}
+
 async function waitForIdleBriefly(ctx: CommandContextLike, progress: ProgressFn): Promise<void> {
 	if (!ctx.waitForIdle) return;
 	progress("Waiting for the current turn to finish…");
@@ -171,6 +235,7 @@ async function runReview(
 	thinkingLevel: ThinkingLevel | undefined,
 	signal: AbortSignal | undefined,
 	timeoutMs: number,
+	onChunk?: (text: string) => void,
 ): Promise<{ text: string; error?: string }> {
 	if (signal?.aborted) return { text: "", error: "aborted" };
 
@@ -193,10 +258,19 @@ async function runReview(
 
 	let accumulated = "";
 	let finalMessage: SessionEvent["message"];
+	let lastEmit = 0;
 	const unsubscribe = inner.subscribe((event: SessionEvent) => {
 		if (event.type === "message_update") {
 			const delta = event.assistantMessageEvent;
-			if (delta?.type === "text_delta" && typeof delta.delta === "string") accumulated += delta.delta;
+			if (delta?.type === "text_delta" && typeof delta.delta === "string") {
+				accumulated += delta.delta;
+				// Stream the in-progress review to the tool's live display (throttled).
+				const now = Date.now();
+				if (onChunk && now - lastEmit >= 100) {
+					lastEmit = now;
+					onChunk(accumulated);
+				}
+			}
 		} else if (event.type === "message_end" && event.message?.role === "assistant") {
 			finalMessage = event.message;
 		}
@@ -204,7 +278,11 @@ async function runReview(
 
 	let timedOut = false;
 	let timer: ReturnType<typeof setTimeout> | undefined;
-	const onAbort = () => inner.abort?.();
+	const aborted = Promise.withResolvers<"aborted">();
+	const onAbort = () => {
+		inner.abort?.();
+		aborted.resolve("aborted");
+	};
 	signal?.addEventListener("abort", onAbort);
 	try {
 		const timeout = Promise.withResolvers<"timeout">();
@@ -214,8 +292,11 @@ async function runReview(
 			timeout.resolve("timeout");
 		}, timeoutMs);
 		const prompt = inner.prompt(userText).then(() => "done" as const);
-		const result = await Promise.race([prompt, timeout.promise]);
+		// Race the abort signal too, so Esc returns immediately instead of hanging
+		// until the inner prompt happens to settle.
+		const result = await Promise.race([prompt, timeout.promise, aborted.promise]);
 		if (result === "timeout") return { text: "", error: `timed out after ${formatDuration(timeoutMs)}` };
+		if (result === "aborted") return { text: "", error: "aborted" };
 	} catch (err) {
 		if (signal?.aborted) return { text: "", error: "aborted" };
 		if (timedOut) return { text: "", error: `timed out after ${formatDuration(timeoutMs)}` };
@@ -389,9 +470,19 @@ interface SecondOpinionOutcome {
 async function runSecondOpinion(
 	pi: ExtensionApi,
 	ctx: ExtensionContextLike,
-	params: { focus?: string; model?: string; effort?: Effort; lookback?: number },
+	params: {
+		focus?: string;
+		model?: string;
+		effort?: Effort;
+		lookback?: number;
+		scope?: ReviewScope;
+		mode?: ReviewMode;
+		reviewers?: number;
+		followup?: string;
+	},
 	signal: AbortSignal | undefined,
 	progress?: ProgressFn,
+	onChunk?: (text: string) => void,
 ): Promise<SecondOpinionOutcome> {
 	const registry = ctx.modelRegistry;
 	if (!ctx.sessionManager) throw new Error("second_opinion has no session transcript to review.");
@@ -399,80 +490,179 @@ async function runSecondOpinion(
 	const available = registry.getAvailable();
 	if (available.length === 0) throw new Error("No authenticated models available for second_opinion.");
 
-	progress?.("Preparing transcript for second opinion…");
-	const { text: transcript, count } = buildTranscript(ctx.sessionManager.getBranch(), params.lookback);
-	if (!transcript.trim()) throw new Error("second_opinion has no prior conversation context to review.");
-	progress?.(`Transcript ready: ${count} entries, ${transcript.length} characters.`);
+	const state = loadState(pi);
+	const scope: ReviewScope = params.scope ?? "both";
+	const followup = params.followup?.trim() || undefined;
+	// A follow-up continues with the previous reviewer (single) for continuity.
+	const last = followup ? state.lastRun : undefined;
+	const modelSelector = params.model?.trim() || (last ? last.reviewer : undefined);
+	let reviewersWanted = clampReviewers(params.reviewers);
+	if (followup) reviewersWanted = 1;
+
+	// Gather the review material: transcript and/or working-tree diff.
+	let transcript = "";
+	let transcriptCount = 0;
+	if (scope !== "diff") {
+		progress?.("Preparing transcript for second opinion…");
+		const built = buildTranscript(ctx.sessionManager.getBranch(), params.lookback);
+		transcript = built.text;
+		transcriptCount = built.count;
+	}
+	let diffText = "";
+	let diffFiles = 0;
+	if (scope !== "transcript") {
+		progress?.("Collecting working-tree diff…");
+		const collected = await collectDiff(ctx.cwd);
+		diffText = collected.text;
+		diffFiles = collected.files;
+	}
+	if (!transcript.trim() && !diffText.trim()) {
+		throw new Error(
+			scope === "diff"
+				? "second_opinion found no working-tree changes to review (git diff is empty)."
+				: "second_opinion has no prior conversation context to review.",
+		);
+	}
+	progress?.(
+		`Material ready: ${transcriptCount} transcript entries (${transcript.length} chars)` +
+			(scope === "transcript" ? "" : `, ${diffFiles} changed files (${diffText.length} diff chars)`) +
+			".",
+	);
 
 	// One-time data-disclosure consent (interactive only; headless implies consent).
-	if (ctx.hasUI && ctx.ui && !envConsented() && !loadState(pi).consented) {
+	if (ctx.hasUI && ctx.ui && !envConsented() && !state.consented) {
 		const ok = await ctx.ui.confirm(
 			"Second opinion — data disclosure",
-			"This sends your full conversation transcript — including tool outputs and any file contents in it — to a " +
-				"separate model, which may be a different vendor than your session model. Continue?",
+			"This sends your conversation transcript and/or working-tree diff — including tool outputs and any file " +
+				"contents in them — to a separate model, which may be a different vendor than your session model. Continue?",
 		);
-		if (!ok) throw new Error("second_opinion cancelled: transcript sharing was declined.");
+		if (!ok) throw new Error("second_opinion cancelled: data sharing was declined.");
 		saveState(pi, { ...loadState(pi), consented: true });
 	}
 
 	progress?.("Selecting second-opinion reviewer…");
-	const plan = await planReviewers(pi, ctx, available, params.model?.trim() || undefined);
-	// Explicit param wins; else the configured selector's `:effort` suffix; else medium.
-	const effort: Effort = params.effort ?? plan.effortHint ?? "medium";
+	const plan = await planReviewers(pi, ctx, available, modelSelector);
+	const effort: Effort = params.effort ?? state.defaultEffort ?? plan.effortHint ?? "medium";
 	const timeoutMs = reviewTimeoutMs();
+	const reviewers = Math.min(reviewersWanted, Math.max(1, plan.candidates.length));
+
+	// Build the reviewer prompt: focus/preset + transcript + diff + (follow-up) prior review.
+	const presetFocus = params.mode && params.mode !== "general" ? FOCUS_PRESETS[params.mode] : undefined;
+	const baseFocus = params.focus?.trim();
+	const focusText =
+		baseFocus && presetFocus
+			? `${presetFocus}\n\nAdditional focus: ${baseFocus}`
+			: (baseFocus ?? presetFocus ?? DEFAULT_FOCUS);
+	const sections: string[] = [focusText];
+	if (transcript.trim()) {
+		sections.push(`---\nPrior conversation transcript (oldest first, most recent last):\n\n${transcript}`);
+	}
+	if (diffText.trim()) {
+		sections.push(`---\nWorking-tree changes (git diff):\n\n${diffText}`);
+	}
+	if (followup) {
+		if (last?.body) sections.push(`---\nYour prior second-opinion review of this work:\n\n${last.body}`);
+		sections.push(`---\nFollow-up instruction from the requester — focus this new review on it:\n\n${followup}`);
+	}
+	const userText = sections.join("\n\n");
+
 	progress?.(
-		`Reviewer candidates: ${plan.candidates.map(formatModel).join(", ") || "none"}; effort=${effort}; timeout=${formatDuration(timeoutMs)}.`,
+		`Reviewer candidates: ${plan.candidates.map(formatModel).join(", ") || "none"}; ` +
+			`reviewers=${reviewers}; effort=${effort}; timeout=${formatDuration(timeoutMs)}.`,
 	);
-	const focus =
-		params.focus?.trim() ||
-		"Independently review the assistant's most recent findings, plan, and code for correctness errors, " +
-			"missed edge cases, faulty reasoning, and unstated assumptions. Be adversarial; do not rubber-stamp.";
-	const userText = `${focus}\n\n---\nPrior conversation transcript (oldest first, most recent last):\n\n${transcript}`;
 
-	const failures: string[] = [];
-	for (const reviewer of plan.candidates) {
-		const reviewerLabel = formatModel(reviewer);
-		progress?.(`Checking access for ${reviewerLabel}…`);
-		const apiKey = await registry.getApiKey(reviewer);
-		if (!apiKey) {
-			const failure = `${reviewerLabel}: no API key`;
-			failures.push(failure);
-			progress?.(failure, "warn");
-			if (plan.source === "explicit") break;
-			continue;
-		}
-		const thinkingLevel = clampThinking(reviewer, effort);
+	const sharedDetails = {
+		scope,
+		mode: params.mode ?? "general",
+		sessionModel: plan.sessionModel ? formatModel(plan.sessionModel) : undefined,
+		source: plan.source,
+		effort,
+		timeoutMs,
+		entriesIncluded: transcriptCount,
+		transcriptChars: transcript.length,
+		diffFiles,
+		followup: followup ?? undefined,
+	};
+
+	interface Attempt {
+		label: string;
+		body?: string;
+		verdict?: ReturnType<typeof parseVerdict>;
+		sameFamily: boolean;
+		error?: string;
+		ms: number;
+	}
+	const attempt = async (reviewer: ModelLike, stream: boolean): Promise<Attempt> => {
+		const label = formatModel(reviewer);
+		const sameFamily = plan.sessionFamily ? plan.familyOf(reviewer) === plan.sessionFamily : false;
 		const started = Date.now();
-		progress?.(
-			`Waiting for ${reviewerLabel}${thinkingLevel ? ` (${thinkingLevel})` : ""}…`,
+		const apiKey = await registry.getApiKey(reviewer);
+		if (!apiKey) return { label, sameFamily, error: "no API key", ms: 0 };
+		const thinkingLevel = clampThinking(reviewer, effort);
+		const { text, error } = await runReview(
+			pi, ctx, reviewer, userText, thinkingLevel, signal, timeoutMs, stream ? onChunk : undefined,
 		);
-		const { text, error } = await runReview(pi, ctx, reviewer, userText, thinkingLevel, signal, timeoutMs);
 		if (error === "aborted") throw new Error("second_opinion review aborted.");
-		if (error || !text) {
-			const failure = `${reviewerLabel}: ${error ?? "empty review"}`;
-			failures.push(failure);
-			progress?.(failure, "warn");
-			if (plan.source === "explicit") break;
-			continue;
-		}
-		progress?.(`Received ${reviewerLabel} review in ${formatDuration(Date.now() - started)}.`);
-
+		const ms = Date.now() - started;
+		if (error || !text) return { label, sameFamily, error: error ?? "empty review", ms };
 		const verdict = parseVerdict(text);
 		const body = verdict && !hasFinalVerdictLine(text) ? `${text}\n\nVerdict: ${verdict}` : text;
-		const sameFamily = plan.sessionFamily ? plan.familyOf(reviewer) === plan.sessionFamily : false;
+		return { label, sameFamily, body, verdict, ms };
+	};
+
+	const persistLast = (reviewer: string, verdict: string | undefined, body: string): void => {
+		saveState(pi, {
+			...loadState(pi),
+			lastRun: { ts: Date.now(), reviewer, focus: focusText, scope, verdict, body },
+		});
+	};
+
+	// Panel mode: run several independent reviewers concurrently and aggregate verdicts.
+	if (reviewers > 1) {
+		const panelists = plan.candidates.slice(0, reviewers);
+		progress?.(`Convening a ${panelists.length}-reviewer panel: ${panelists.map(formatModel).join(", ")}…`);
+		const results = await Promise.all(panelists.map(r => attempt(r, false)));
+		const ok = results.filter((r): r is Attempt & { body: string } => typeof r.body === "string");
+		for (const r of results) {
+			progress?.(
+				r.body ? `${r.label}: ${r.verdict ?? "—"} in ${formatDuration(r.ms)}.` : `${r.label}: ${r.error}`,
+				r.body ? "info" : "warn",
+			);
+		}
+		if (ok.length === 0) {
+			throw new Error(`second_opinion panel obtained no reviews. Tried: ${results.map(r => `${r.label}: ${r.error}`).join("; ")}.`);
+		}
+		const aggregate = mostSevereVerdict(ok.map(r => r.verdict));
+		const header = `## Panel second opinion — ${ok.length} reviewer${ok.length > 1 ? "s" : ""}\n\nAggregate verdict: ${aggregate ?? "—"}`;
+		const body = [header, ...ok.map(r => `### ${r.label} — ${r.verdict ?? "—"}\n\n${r.body}`)].join("\n\n");
+		persistLast(ok[0].label, aggregate, body);
 		return {
 			body,
 			details: {
-				verdict,
-				reviewerModel: reviewerLabel,
-				sessionModel: plan.sessionModel ? formatModel(plan.sessionModel) : undefined,
-				source: plan.source,
-				sameFamily,
-				effort,
-				timeoutMs,
-				entriesIncluded: count,
-				transcriptChars: transcript.length,
+				...sharedDetails,
+				verdict: aggregate,
+				reviewerModel: `panel(${ok.map(r => r.label).join(", ")})`,
+				panel: ok.map(r => ({ reviewer: r.label, verdict: r.verdict, sameFamily: r.sameFamily })),
 			},
+		};
+	}
+
+	// Single-reviewer mode: try candidates in order until one succeeds.
+	const failures: string[] = [];
+	for (const reviewer of plan.candidates) {
+		progress?.(`Waiting for ${formatModel(reviewer)}…`);
+		const r = await attempt(reviewer, true);
+		if (!r.body) {
+			failures.push(`${r.label}: ${r.error}`);
+			progress?.(`${r.label}: ${r.error}`, "warn");
+			if (plan.source === "explicit") break;
+			continue;
+		}
+		progress?.(`Received ${r.label} review in ${formatDuration(r.ms)}.`);
+		persistLast(r.label, r.verdict, r.body);
+		return {
+			body: r.body,
+			details: { ...sharedDetails, verdict: r.verdict, reviewerModel: r.label, sameFamily: r.sameFamily },
 		};
 	}
 
@@ -497,21 +687,37 @@ export default function secondOpinionExtension(pi: ExtensionApi): void {
 					.string()
 					.describe("What the reviewer should pressure-test. Omit for a general adversarial review.")
 					.optional(),
+				mode: z
+					.enum(["general", "security", "performance", "tests", "architecture", "correctness"])
+					.describe("Focus preset. Combined with `focus` if both are given. Defaults to general.")
+					.optional(),
+				scope: z
+					.enum(["transcript", "diff", "both"])
+					.describe("What to review: the conversation, the uncommitted git diff, or both (default).")
+					.optional(),
+				reviewers: z
+					.number()
+					.int()
+					.positive()
+					.describe("Number of independent panel reviewers (1–4, default 1). >1 aggregates verdicts.")
+					.optional(),
+				followup: z
+					.string()
+					.describe("Re-run the previous reviewer on the same work plus its prior review, steered by this instruction.")
+					.optional(),
 				model: z
 					.string()
 					.describe('Explicit reviewer selector ("provider/id", "id", or substring). Bypasses the configured reviewer.')
 					.optional(),
 				effort: z
 					.enum(["off", "minimal", "low", "medium", "high", "xhigh"])
-					.describe(
-						"Reviewer reasoning effort, clamped to what the model supports. Omit to use the configured reviewer's level (e.g. modelRoles.slow `…:xhigh`), else medium.",
-					)
+					.describe("Reviewer reasoning effort, clamped to what the model supports. Omit to use the configured default.")
 					.optional(),
 				lookback: z
 					.number()
 					.int()
 					.positive()
-					.describe("Limit to the N most recent message turns. Omit to include all that fit the budget.")
+					.describe("Limit the transcript portion to the N most recent message turns.")
 					.optional(),
 			})
 			.strict(),
@@ -523,17 +729,29 @@ export default function secondOpinionExtension(pi: ExtensionApi): void {
 						details: { phase: "progress", level },
 					})
 				: undefined;
+			const onChunk = onUpdate
+				? (text: string) =>
+					onUpdate({
+						content: [{ type: "text", text }],
+						details: { phase: "review" },
+					})
+				: undefined;
 			const result = await runSecondOpinion(
 				pi,
 				ctx,
 				{
 					focus: typeof params.focus === "string" ? params.focus : undefined,
+					mode: typeof params.mode === "string" ? (params.mode as ReviewMode) : undefined,
+					scope: typeof params.scope === "string" ? (params.scope as ReviewScope) : undefined,
+					reviewers: typeof params.reviewers === "number" ? params.reviewers : undefined,
+					followup: typeof params.followup === "string" ? params.followup : undefined,
 					model: typeof params.model === "string" ? params.model : undefined,
 					effort: isEffort(params.effort) ? params.effort : undefined,
 					lookback: typeof params.lookback === "number" ? params.lookback : undefined,
 				},
 				signal,
 				progress,
+				onChunk,
 			);
 			const output: AgentToolResult = {
 				content: [{ type: "text", text: result.body }],
@@ -551,21 +769,15 @@ export default function secondOpinionExtension(pi: ExtensionApi): void {
 			progress("Requesting a second opinion…");
 			try {
 				await waitForIdleBriefly(ctx, progress);
-				const result = await runSecondOpinion(
-					pi,
-					ctx,
-					{ focus: args.trim() || undefined },
-					undefined,
-					progress,
-				);
+				const result = await runSecondOpinion(pi, ctx, { focus: args.trim() || undefined }, undefined, progress);
 				const verdict = typeof result.details.verdict === "string" ? result.details.verdict : "—";
 				const reviewer = String(result.details.reviewerModel ?? "reviewer");
-				const autoHandoff = commandAutoHandoff();
+				const autoHandoff = commandAutoHandoff(loadState(pi));
 				const followUp = autoHandoff
 					? "Assess this second opinion against your current direction: adopt the valid points, " +
 						"briefly push back (with reasons) on any you disagree with, and present a concrete, " +
 						"updated plan for how to proceed."
-					: "Auto hand-off is disabled by OMP_SECOND_OPINION_AUTO_HANDOFF=0; review posted without starting a model turn.";
+					: "Auto hand-off is off; review posted without starting a model turn.";
 				pi.sendMessage(
 					{
 						customType: "second-opinion",
@@ -588,6 +800,87 @@ export default function secondOpinionExtension(pi: ExtensionApi): void {
 			} catch (err) {
 				ctx.ui?.notify(`Second opinion failed: ${String(err instanceof Error ? err.message : err)}`, "error");
 			}
+		},
+	});
+
+	pi.registerCommand("second-opinion-config", {
+		description: "Configure the second-opinion reviewer, effort, consent, and hand-off",
+		handler: async (_args, ctx) => {
+			if (!ctx.hasUI || !ctx.ui) return;
+			const ui = ctx.ui;
+			for (;;) {
+				const state = loadState(pi);
+				const menu: UiSelectOption[] = [
+					{ label: "Reviewer", description: state.reviewer ?? "auto (cross-family default)" },
+					{ label: "Default effort", description: state.defaultEffort ?? "auto" },
+					{ label: "Consent", description: state.consented ? "granted" : "not granted" },
+					{ label: "Auto hand-off", description: (state.autoHandoff ?? true) ? "on" : "off" },
+					{ label: "Forget saved settings", description: "reset reviewer, effort, consent" },
+				];
+				const choice = await ui.select("Second-opinion settings", menu);
+				if (choice === undefined) break;
+				if (choice === "Reviewer") {
+					const registry = ctx.modelRegistry;
+					const available = registry?.getAvailable() ?? [];
+					if (available.length === 0) {
+						ui.notify("No authenticated models available.", "warn");
+						continue;
+					}
+					const familyOf = (m: ModelLike): string => modelFamily(m, registry?.getCanonicalId(m));
+					const current = state.reviewer ? resolveSelector(state.reviewer, available) : undefined;
+					const picked = await runPicker(ctx, available, current, ctx.model, familyOf);
+					if (picked) {
+						const sessionFamily = ctx.model ? familyOf(ctx.model) : undefined;
+						saveState(pi, { ...loadState(pi), reviewer: formatModel(picked), fingerprint: sessionFamily });
+						ui.notify(`Reviewer set to ${formatModel(picked)}.`, "info");
+					}
+				} else if (choice === "Default effort") {
+					const efforts = ["auto", "off", "minimal", "low", "medium", "high", "xhigh"];
+					const e = await ui.select("Default reviewer effort", efforts.map(label => ({ label })));
+					if (e !== undefined) {
+						saveState(pi, { ...loadState(pi), defaultEffort: e === "auto" ? undefined : (e as Effort) });
+						ui.notify(`Default effort: ${e}.`, "info");
+					}
+				} else if (choice === "Consent") {
+					const granted = !loadState(pi).consented;
+					saveState(pi, { ...loadState(pi), consented: granted });
+					ui.notify(granted ? "Consent granted." : "Consent revoked.", "info");
+				} else if (choice === "Auto hand-off") {
+					const next = !(loadState(pi).autoHandoff ?? true);
+					saveState(pi, { ...loadState(pi), autoHandoff: next });
+					ui.notify(`Auto hand-off ${next ? "on" : "off"}.`, "info");
+				} else if (choice === "Forget saved settings") {
+					const ok = await ui.confirm("Forget settings", "Reset saved reviewer, effort, and consent?");
+					if (ok) {
+						const { lastRun } = loadState(pi);
+						saveState(pi, lastRun ? { lastRun } : {});
+						ui.notify("Settings reset.", "info");
+					}
+				}
+			}
+		},
+	});
+
+	pi.registerCommand("second-opinion-last", {
+		description: "Re-display the most recent second-opinion review",
+		handler: async (_args, ctx) => {
+			if (!ctx.hasUI) return;
+			const last = loadState(pi).lastRun;
+			if (!last) {
+				ctx.ui?.notify("No saved second opinion yet.", "warn");
+				return;
+			}
+			const ageMin = Math.max(0, Math.round((Date.now() - last.ts) / 60_000));
+			pi.sendMessage(
+				{
+					customType: "second-opinion",
+					content: `Most recent second opinion — **${last.reviewer}**, verdict **${last.verdict ?? "—"}** (${ageMin}m ago):\n\n${last.body}`,
+					display: true,
+					attribution: "user",
+				},
+				{ triggerTurn: false },
+			);
+			ctx.ui?.notify(`Second opinion: ${last.verdict ?? "—"} (${last.reviewer})`, "info");
 		},
 	});
 }

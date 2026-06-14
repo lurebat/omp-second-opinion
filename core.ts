@@ -149,6 +149,18 @@ export function parseVerdict(text: string): Verdict | undefined {
 	return verdictFromFinalLine(text) ?? scanVerdict(text);
 }
 
+const VERDICT_SEVERITY: Record<Verdict, number> = { SOUND: 0, SOUND_WITH_CAVEATS: 1, FLAWED: 2 };
+
+/** Pick the most severe verdict across a panel (FLAWED > SOUND_WITH_CAVEATS > SOUND). */
+export function mostSevereVerdict(verdicts: ReadonlyArray<Verdict | undefined>): Verdict | undefined {
+	let best: Verdict | undefined;
+	for (const v of verdicts) {
+		if (!v) continue;
+		if (best === undefined || VERDICT_SEVERITY[v] > VERDICT_SEVERITY[best]) best = v;
+	}
+	return best;
+}
+
 /**
  * Family = the leading series token of the model's canonical id (e.g.
  * `claude-opus-4-8-1m` → `claude`, `gemini-3-pro-preview` → `gemini`,

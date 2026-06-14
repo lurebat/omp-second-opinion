@@ -14,9 +14,9 @@ from an extension. See "How it differs" below for the exact emulation seams.
 
 ## What it does
 
-Sends the **current session branch transcript** to a **different** (ideally
-cross-family) model for an independent, adversarial review of your findings,
-plan, or code, and returns a structured verdict:
+Sends the **current session transcript and/or your uncommitted `git diff`** to a
+**different** (ideally cross-family) model for an independent, adversarial review
+of your findings, plan, or code, and returns a structured verdict:
 
 - `SOUND` — no material issues
 - `SOUND_WITH_CAVEATS` — works, but with caveats worth addressing
@@ -80,14 +80,30 @@ model reads the second opinion, weighs its points, pushes back where warranted,
 and presents an updated plan. Set `OMP_SECOND_OPINION_AUTO_HANDOFF=0` to post the
 review without starting that follow-up turn.
 
+### Commands
+
+- `/second-opinion [focus]` — run a review of the current work and (by default) hand the result to the model.
+- `/second-opinion-config` — interactively set the saved reviewer, default effort, consent, and auto-hand-off, or reset them.
+- `/second-opinion-last` — re-display the most recent review (it is otherwise ephemeral).
+
+### Panels, scope, and follow-ups
+
+- **Panel:** `reviewers: 3` convenes three cross-family models that review independently; the verdict is the most severe across the panel, with each reviewer's section shown.
+- **Diff scope:** by default the reviewer also sees your uncommitted `git diff` (staged + unstaged). Use `scope: "diff"` to review only the changes, or `scope: "transcript"` for chat only. Non-git directories silently fall back to the transcript.
+- **Follow-up:** after a review, call again with `followup: "…"` to push back or ask the same reviewer to dig deeper — it re-runs the previous reviewer on the same work plus its prior review.
+
 ### Tool parameters
 
 | Param | Default | Meaning |
 |---|---|---|
 | `focus` | general adversarial review | What the reviewer should pressure-test |
+| `mode` | `general` | Focus preset: `security`/`performance`/`tests`/`architecture`/`correctness`. Combined with `focus` if both are given |
+| `scope` | `both` | What to review: `transcript`, `diff` (uncommitted git changes), or `both` |
+| `reviewers` | `1` | Independent panel reviewers (1–4). `>1` runs them concurrently and aggregates verdicts (most-severe wins) |
+| `followup` | — | Re-run the **previous** reviewer on the same work plus its prior review, steered by this instruction |
 | `model` | configured / auto cross-family | Explicit reviewer selector (`provider/id`, `id`, or substring) |
-| `effort` | inherited / `medium` | Reviewer reasoning effort (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`), clamped to model support. Omitted → inherits the configured selector's `:effort` suffix (e.g. `modelRoles.slow` = `…:xhigh`), else `medium` |
-| `lookback` | all that fits | Limit to the N most recent rendered transcript turns |
+| `effort` | inherited / `medium` | Reviewer reasoning effort (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`), clamped to model support. Omitted → the saved default, else the configured selector's `:effort` suffix (e.g. `modelRoles.slow` = `…:xhigh`), else `medium` |
+| `lookback` | all that fits | Limit the transcript portion to the N most recent rendered turns |
 
 ### Reviewer resolution
 
@@ -114,9 +130,9 @@ lineage. Falls back to the provider when no series token exists.
 
 ## Privacy & consent
 
-This tool forwards your **full conversation transcript — including tool outputs
-and any file contents it contains** — to another model, possibly a different
-vendor than your session model.
+This tool forwards your **conversation transcript and/or uncommitted `git diff` —
+including tool outputs and any file contents they contain** — to another model,
+possibly a different vendor than your session model.
 
 - Interactive sessions show a **one-time data-disclosure confirm** before the
   first review; the decision is persisted.
@@ -134,10 +150,10 @@ same-family picks are flagged as weaker.
 | `OMP_SECOND_OPINION_MODEL` | Default reviewer selector (headless/ops override) |
 | `OMP_SECOND_OPINION_CONSENT=1` | Pre-grant transcript-sharing consent |
 | `OMP_SECOND_OPINION_TIMEOUT_SECONDS` / `OMP_SECOND_OPINION_TIMEOUT_MS` | Reviewer request timeout (default: 180s) |
-| `OMP_SECOND_OPINION_AUTO_HANDOFF=0` | Slash command posts the review without triggering the main model turn |
+| `OMP_SECOND_OPINION_AUTO_HANDOFF=0` | Slash command posts the review without triggering the main model turn (env overrides the `/second-opinion-config` toggle) |
 | `modelRoles.secondopinion` | Native model role read as the configured reviewer when present |
 | `modelRoles.slow` | Used as a fallback reviewer and effort-suffix source |
-| `<agentDir>/second-opinion.json` | Persisted `consented` / `reviewer` / `fingerprint` |
+| `<agentDir>/second-opinion.json` | Persisted `consented` / `reviewer` / `fingerprint` / `defaultEffort` / `autoHandoff` / `lastRun` |
 
 ## Files
 
