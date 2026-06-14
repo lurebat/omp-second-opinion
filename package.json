@@ -1,0 +1,33 @@
+{
+  "name": "omp-second-opinion",
+  "version": "1.0.0",
+  "description": "Independent, cross-family adversarial second-opinion review tool for oh-my-pi.",
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "index.ts",
+    "core.ts",
+    "prompts.ts",
+    "types.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "oh-my-pi",
+    "omp",
+    "extension",
+    "second-opinion",
+    "ai-review"
+  ],
+  "homepage": "https://github.com/lurebat/omp-second-opinion#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lurebat/omp-second-opinion.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lurebat/omp-second-opinion/issues"
+  },
+  "omp": {
+    "extensions": ["./index.ts"]
+  }
+}
