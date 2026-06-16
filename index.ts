@@ -64,6 +64,11 @@ interface LastRun {
 	body: string;
 }
 
+interface DataConsent {
+	transcript?: boolean;
+	diff?: boolean;
+}
+
 interface ExtensionState {
 	consented?: boolean;
 	reviewer?: string;
@@ -71,6 +76,7 @@ interface ExtensionState {
 	defaultEffort?: Effort;
 	autoHandoff?: boolean;
 	lastRun?: LastRun;
+	dataConsent?: DataConsent;
 }
 
 type ProgressLevel = "info" | "warn" | "error";
@@ -134,6 +140,59 @@ function envConsented(): boolean {
 	const v = (process.env.OMP_SECOND_OPINION_CONSENT ?? "").toLowerCase();
 	return v === "1" || v === "true" || v === "yes";
 }
+
+function needsTranscriptConsent(scope: ReviewScope): boolean {
+	return scope !== "diff";
+}
+
+function needsDiffConsent(scope: ReviewScope, diffText: string): boolean {
+	return scope !== "transcript" && diffText.trim().length > 0;
+}
+
+function hasDataConsent(state: ExtensionState, scope: ReviewScope, diffText: string): boolean {
+	const transcriptAllowed = state.consented === true || state.dataConsent?.transcript === true;
+	const diffAllowed = state.dataConsent?.diff === true;
+	return (
+		(!needsTranscriptConsent(scope) || transcriptAllowed) &&
+		(!needsDiffConsent(scope, diffText) || diffAllowed)
+	);
+}
+
+function grantDataConsent(state: ExtensionState, scope: ReviewScope, diffText: string): ExtensionState {
+	const dataConsent: DataConsent = { ...state.dataConsent };
+	if (needsTranscriptConsent(scope)) dataConsent.transcript = true;
+	if (needsDiffConsent(scope, diffText)) dataConsent.diff = true;
+	return { ...state, consented: dataConsent.transcript ?? state.consented, dataConsent };
+}
+
+function hasFullDataConsent(state: ExtensionState): boolean {
+	return (state.consented === true || state.dataConsent?.transcript === true) && state.dataConsent?.diff === true;
+}
+
+function setFullDataConsent(state: ExtensionState, granted: boolean): ExtensionState {
+	return {
+		...state,
+		consented: granted,
+		dataConsent: { transcript: granted, diff: granted },
+	};
+}
+
+function describeDataConsent(state: ExtensionState): string {
+	const transcript = state.consented === true || state.dataConsent?.transcript === true;
+	const diff = state.dataConsent?.diff === true;
+	if (transcript && diff) return "granted for transcript + diff";
+	if (transcript) return "granted for transcript only";
+	if (diff) return "granted for diff only";
+	return "not granted";
+}
+
+export const __testing = {
+	describeDataConsent,
+	grantDataConsent,
+	hasDataConsent,
+	hasFullDataConsent,
+	setFullDataConsent,
+};
 
 function envDisabled(name: string): boolean {
 	const v = (process.env[name] ?? "").toLowerCase();
@@ -529,15 +588,25 @@ async function runSecondOpinion(
 			".",
 	);
 
-	// One-time data-disclosure consent (interactive only; headless implies consent).
-	if (ctx.hasUI && ctx.ui && !envConsented() && !state.consented) {
+	if (!ctx.hasUI && !envConsented() && needsDiffConsent(scope, diffText)) {
+		throw new Error(
+			"second_opinion would include working-tree diff in a non-interactive session; " +
+				"set OMP_SECOND_OPINION_CONSENT=1 or use scope=\"transcript\".",
+		);
+	}
+
+	// One-time data-disclosure consent (interactive only; env pre-consents).
+	// Legacy `consented: true` covered transcript sharing only. Diff sharing is
+	// scope-tracked so upgrading to the diff-aware default never silently forwards
+	// working-tree changes under an older transcript-only consent.
+	if (ctx.hasUI && ctx.ui && !envConsented() && !hasDataConsent(state, scope, diffText)) {
 		const ok = await ctx.ui.confirm(
 			"Second opinion — data disclosure",
 			"This sends your conversation transcript and/or working-tree diff — including tool outputs and any file " +
 				"contents in them — to a separate model, which may be a different vendor than your session model. Continue?",
 		);
 		if (!ok) throw new Error("second_opinion cancelled: data sharing was declined.");
-		saveState(pi, { ...loadState(pi), consented: true });
+		saveState(pi, grantDataConsent(loadState(pi), scope, diffText));
 	}
 
 	progress?.("Selecting second-opinion reviewer…");
@@ -813,7 +882,7 @@ export default function secondOpinionExtension(pi: ExtensionApi): void {
 				const menu: UiSelectOption[] = [
 					{ label: "Reviewer", description: state.reviewer ?? "auto (cross-family default)" },
 					{ label: "Default effort", description: state.defaultEffort ?? "auto" },
-					{ label: "Consent", description: state.consented ? "granted" : "not granted" },
+					{ label: "Consent", description: describeDataConsent(state) },
 					{ label: "Auto hand-off", description: (state.autoHandoff ?? true) ? "on" : "off" },
 					{ label: "Forget saved settings", description: "reset reviewer, effort, consent" },
 				];
@@ -842,9 +911,9 @@ export default function secondOpinionExtension(pi: ExtensionApi): void {
 						ui.notify(`Default effort: ${e}.`, "info");
 					}
 				} else if (choice === "Consent") {
-					const granted = !loadState(pi).consented;
-					saveState(pi, { ...loadState(pi), consented: granted });
-					ui.notify(granted ? "Consent granted." : "Consent revoked.", "info");
+					const granted = !hasFullDataConsent(loadState(pi));
+					saveState(pi, setFullDataConsent(loadState(pi), granted));
+					ui.notify(granted ? "Consent granted for transcript + diff." : "Consent revoked.", "info");
 				} else if (choice === "Auto hand-off") {
 					const next = !(loadState(pi).autoHandoff ?? true);
 					saveState(pi, { ...loadState(pi), autoHandoff: next });

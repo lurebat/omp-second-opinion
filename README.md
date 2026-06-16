@@ -134,10 +134,10 @@ This tool forwards your **conversation transcript and/or uncommitted `git diff` 
 including tool outputs and any file contents they contain** — to another model,
 possibly a different vendor than your session model.
 
-- Interactive sessions show a **one-time data-disclosure confirm** before the
-  first review; the decision is persisted.
-- Headless / print / RPC sessions treat use as consent (nothing is persisted).
-- Set `OMP_SECOND_OPINION_CONSENT=1` to pre-consent (e.g. CI).
+- Interactive sessions show a **one-time data-disclosure confirm** for each data
+  class before first use; old transcript-only consent does not silently authorize diff sharing.
+- Headless / print / RPC sessions treat transcript-only reviews as consented, but
+  require `OMP_SECOND_OPINION_CONSENT=1` before sending a non-empty git diff.
 
 On the first interactive run (and whenever the session/reviewer family changes)
 a **reviewer picker** is offered; the choice is saved as the default and
@@ -148,12 +148,12 @@ same-family picks are flagged as weaker.
 | Mechanism | Effect |
 |---|---|
 | `OMP_SECOND_OPINION_MODEL` | Default reviewer selector (headless/ops override) |
-| `OMP_SECOND_OPINION_CONSENT=1` | Pre-grant transcript-sharing consent |
+| `OMP_SECOND_OPINION_CONSENT=1` | Pre-grant transcript + diff sharing consent |
 | `OMP_SECOND_OPINION_TIMEOUT_SECONDS` / `OMP_SECOND_OPINION_TIMEOUT_MS` | Reviewer request timeout (default: 180s) |
 | `OMP_SECOND_OPINION_AUTO_HANDOFF=0` | Slash command posts the review without triggering the main model turn (env overrides the `/second-opinion-config` toggle) |
 | `modelRoles.secondopinion` | Native model role read as the configured reviewer when present |
 | `modelRoles.slow` | Used as a fallback reviewer and effort-suffix source |
-| `<agentDir>/second-opinion.json` | Persisted `consented` / `reviewer` / `fingerprint` / `defaultEffort` / `autoHandoff` / `lastRun` |
+| `<agentDir>/second-opinion.json` | Persisted `consented` / `dataConsent` / `reviewer` / `fingerprint` / `defaultEffort` / `autoHandoff` / `lastRun` |
 
 ## Files
 

@@ -30,7 +30,7 @@ export const TOOL_DESCRIPTION = `Send the current work to a different model for 
 - Set \`reviewers\` > 1 to convene a cross-family panel: several different models review independently and their verdicts are aggregated (most-severe wins). Stronger signal, higher cost
 - After a review, call again with \`followup\` to push back or ask the same reviewer to dig deeper — it re-runs on the same model with your prior review plus the new instruction
 - A cross-family reviewer (different model lineage than this session) catches more, because it does not share your blind spots; the tool prefers one by default
-- This forwards your transcript and/or diff (including tool outputs and file contents) to another model, possibly a different vendor. It is gated behind a one-time consent in interactive sessions
+- This forwards your transcript and/or diff (including tool outputs and file contents) to another model, possibly a different vendor. Interactive sessions require consent for each data class before first use
 </instruction>
 
 <parameters>
