@@ -118,6 +118,8 @@ export interface ZodModule {
 	string(): ZodType;
 	number(): ZodType;
 	enum(values: readonly string[]): ZodType;
+	boolean(): ZodType;
+	array(item: ZodType): ZodType;
 }
 
 export interface ZodType {

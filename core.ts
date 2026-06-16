@@ -122,17 +122,61 @@ export function scanVerdict(text: string): Verdict | undefined {
 }
 
 const FINAL_VERDICT_LINE = /^\s*\*{0,2}verdict\*{0,2}\s*:\s*\*{0,2}(SOUND[\s_-]?WITH[\s_-]?CAVEATS|FLAWED|SOUND)\*{0,2}\s*\.?\s*$/i;
+const REVIEW_META_LINE = /^\s*ReviewMeta\s*:\s*(\{.*\})\s*$/i;
+
+export interface ReviewMeta {
+	verdict?: Verdict;
+	blockingIssues?: number;
+	caveats?: number;
+	confidence?: number;
+}
+
+function normalizeVerdictToken(value: unknown): Verdict | undefined {
+	if (typeof value !== "string") return undefined;
+	const token = value.replace(/[\s_-]+/g, "_").toUpperCase();
+	if (token === "FLAWED") return "FLAWED";
+	if (token === "SOUND_WITH_CAVEATS") return "SOUND_WITH_CAVEATS";
+	if (token === "SOUND") return "SOUND";
+	return undefined;
+}
+
+function boundedInteger(value: unknown): number | undefined {
+	if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+	return Math.max(0, Math.floor(value));
+}
+
+/** Parse the optional final `ReviewMeta: {...}` trailer without trusting arbitrary prose. */
+export function parseReviewMeta(text: string): ReviewMeta | undefined {
+	const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+	for (let i = lines.length - 1; i >= Math.max(0, lines.length - 3); i--) {
+		const match = lines[i]?.match(REVIEW_META_LINE);
+		if (!match) continue;
+		try {
+			const parsed = JSON.parse(match[1]) as Record<string, unknown>;
+			const verdict = normalizeVerdictToken(parsed.verdict);
+			return {
+				verdict,
+				blockingIssues: boundedInteger(parsed.blockingIssues),
+				caveats: boundedInteger(parsed.caveats),
+				confidence: boundedInteger(parsed.confidence),
+			};
+		} catch {
+			return undefined;
+		}
+	}
+	return undefined;
+}
 
 function verdictFromFinalLine(text: string): Verdict | undefined {
 	const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-	const last = lines[lines.length - 1];
-	if (!last) return undefined;
-	const match = last.match(FINAL_VERDICT_LINE);
-	if (!match) return undefined;
-	const token = match[1].replace(/[\s_-]+/g, "_").toUpperCase();
-	if (token === "FLAWED") return "FLAWED";
-	if (token === "SOUND_WITH_CAVEATS") return "SOUND_WITH_CAVEATS";
-	return "SOUND";
+	for (let i = lines.length - 1; i >= Math.max(0, lines.length - 3); i--) {
+		const last = lines[i];
+		if (!last || REVIEW_META_LINE.test(last)) continue;
+		const match = last.match(FINAL_VERDICT_LINE);
+		if (!match) return undefined;
+		return normalizeVerdictToken(match[1]);
+	}
+	return undefined;
 }
 
 export function hasFinalVerdictLine(text: string): boolean {
@@ -140,13 +184,13 @@ export function hasFinalVerdictLine(text: string): boolean {
 }
 
 /**
- * Extract the reviewer's verdict. The only strong signal is the final
- * standalone `Verdict: …` line. This avoids treating quoted examples,
+ * Extract the reviewer's verdict. Strong signals are the structured trailer and
+ * final standalone `Verdict: …` line. This avoids treating quoted examples,
  * negations, or earlier-reviewer references as the reviewer's own verdict.
- * Falls back to severity keyword scan only when the final line is absent.
+ * Falls back to severity keyword scan only when no strong signal is present.
  */
 export function parseVerdict(text: string): Verdict | undefined {
-	return verdictFromFinalLine(text) ?? scanVerdict(text);
+	return parseReviewMeta(text)?.verdict ?? verdictFromFinalLine(text) ?? scanVerdict(text);
 }
 
 const VERDICT_SEVERITY: Record<Verdict, number> = { SOUND: 0, SOUND_WITH_CAVEATS: 1, FLAWED: 2 };
@@ -159,6 +203,112 @@ export function mostSevereVerdict(verdicts: ReadonlyArray<Verdict | undefined>):
 		if (best === undefined || VERDICT_SEVERITY[v] > VERDICT_SEVERITY[best]) best = v;
 	}
 	return best;
+}
+
+export interface PanelReviewSummaryInput {
+	reviewer: string;
+	verdict?: Verdict;
+	error?: string;
+}
+
+/** Deterministic panel digest: split/unanimous verdicts plus failures. */
+export function summarizePanel(inputs: ReadonlyArray<PanelReviewSummaryInput>): string {
+	const ok = inputs.filter(i => i.verdict);
+	const failed = inputs.filter(i => !i.verdict && i.error);
+	if (ok.length === 0) {
+		return failed.length === 0 ? "No reviewer returned a parseable verdict." : `${failed.length} reviewer(s) failed.`;
+	}
+	const counts = new Map<Verdict, number>();
+	for (const item of ok) counts.set(item.verdict!, (counts.get(item.verdict!) ?? 0) + 1);
+	const parts = VERDICTS
+		.map(v => `${v}: ${counts.get(v) ?? 0}`)
+		.filter(p => !p.endsWith(": 0"));
+	const split = counts.size === 1 ? `unanimous ${ok[0].verdict}` : `split (${parts.join(", ")})`;
+	return failed.length === 0 ? split : `${split}; ${failed.length} reviewer(s) failed`;
+}
+
+export interface RedactionFinding {
+	kind: string;
+	severity: "block" | "redact";
+	count: number;
+}
+
+export interface RedactionResult {
+	text: string;
+	findings: RedactionFinding[];
+	blocked: boolean;
+}
+
+
+/** Scan secrets, redact medium-confidence values, and block high-confidence values unless explicitly allowed. */
+export function scanAndRedactMaterial(text: string, allowSecrets = false): RedactionResult {
+	if (!text.trim()) return { text, findings: [], blocked: false };
+	const scan = scanSecrets(text);
+	const findings: RedactionFinding[] = scan.matches.map(m => ({
+		kind: m.kind,
+		severity: m.confidence === "high" ? "block" : "redact",
+		count: 1,
+	}));
+	return { text: redactSecrets(text), findings, blocked: scan.hasHigh && !allowSecrets };
+}
+
+/** Stable, deterministic non-cryptographic hash for stale-review detection. */
+export function hashMaterial(parts: ReadonlyArray<string | undefined>): string {
+	let h = 0x811c9dc5;
+	for (const part of parts) {
+		const text = part ?? "";
+		for (let i = 0; i < text.length; i++) {
+			h ^= text.charCodeAt(i);
+			h = Math.imul(h, 0x01000193) >>> 0;
+		}
+		h ^= 0xff;
+		h = Math.imul(h, 0x01000193) >>> 0;
+	}
+	return h.toString(16).padStart(8, "0");
+}
+
+/**
+ * Compare a stored material hash against the current one.
+ * Returns "current" when they match, "changed" when they differ, "unknown" when
+ * no stored hash is available (pre-hash run, missing scope data, or unreachable material).
+ */
+export function isStaleHash(
+	stored: string | undefined,
+	current: string,
+): "current" | "changed" | "unknown" {
+	if (!stored) return "unknown";
+	return stored === current ? "current" : "changed";
+}
+
+export function globToRegExp(glob: string): RegExp {
+	let out = "^";
+	for (let i = 0; i < glob.length; i++) {
+		const ch = glob[i];
+		if (ch === "*") {
+			if (glob[i + 1] === "*") {
+				if (glob[i + 2] === "/") {
+					out += "(?:.*/)?";
+					i += 2;
+				} else {
+					out += ".*";
+					i++;
+				}
+			} else {
+				out += "[^/]*";
+			}
+		} else if (ch === "?") {
+			out += "[^/]";
+		} else {
+			out += ch.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
+		}
+	}
+	return new RegExp(`${out}$`);
+}
+
+export function matchesAnyGlob(path: string, globs: ReadonlyArray<string> | undefined): boolean {
+	if (!globs || globs.length === 0) return false;
+	const normalized = path.replace(/\\/g, "/");
+	return globs.some(glob => globToRegExp(glob.replace(/\\/g, "/")).test(normalized));
 }
 
 /**
@@ -301,4 +451,197 @@ export function clampThinking(model: ModelLike, effort: Effort): ThinkingLevel |
 		}
 	}
 	return best ?? supported[0];
+}
+
+// ─── Secret scanning and redaction ───────────────────────────────────────────
+
+/** Metadata about one detected secret. The matched value is never stored here. */
+export interface SecretMatch {
+	/** A stable category label — never the matched value. */
+	kind: string;
+	confidence: "high" | "medium";
+}
+
+export interface SecretScanResult {
+	/** One entry per distinct kind detected (deduplicated by kind+confidence). */
+	matches: SecretMatch[];
+	hasHigh: boolean;
+	hasMedium: boolean;
+}
+
+/**
+ * Internal pattern table. Stored as source+flags strings so every call gets a
+ * fresh, non-stateful RegExp instance — sharing a /g regex across calls would
+ * silently skip matches due to stale `lastIndex`.
+ *
+ * For medium entries `replaceWith` drives `redactSecrets`: it may reference
+ * capture group $1 (the key+separator prefix). The matched value is never
+ * surfaced externally.
+ */
+interface SecretPatternEntry {
+	kind: string;
+	confidence: "high" | "medium";
+	/** Regex source without flags — flags are applied per call. */
+	source: string;
+	flags: string;
+	/** Replacement template for medium patterns used by `redactSecrets`. */
+	replaceWith?: string;
+}
+
+const SECRET_PATTERNS: ReadonlyArray<SecretPatternEntry> = [
+	// ── High confidence ──────────────────────────────────────────────────────
+	// AWS IAM access-key ID prefixes (AKIA long-term, ASIA STS short-term, etc.)
+	{
+		kind: "aws-access-key",
+		confidence: "high",
+		source: "\\b(?:AKIA|ASIA|AIDA|AROA|ANPA|ANVA|APKA)[A-Z0-9]{16}\\b",
+		flags: "",
+	},
+	// GitHub tokens: ghp_ (PAT), gho_ (OAuth), ghs_ (server-to-server),
+	// ghu_ (user-to-server), ghr_ (refresh)
+	{
+		kind: "github-token",
+		confidence: "high",
+		source: "\\bgh[pousr]_[A-Za-z0-9]{36,}\\b",
+		flags: "",
+	},
+	// GitHub fine-grained PATs
+	{
+		kind: "github-pat",
+		confidence: "high",
+		source: "\\bgithub_pat_[A-Za-z0-9_]{20,}\\b",
+		flags: "",
+	},
+	// OpenAI-style sk- API keys (also used by Anthropic legacy, etc.)
+	{
+		kind: "openai-key",
+		confidence: "high",
+		source: "\\bsk-[A-Za-z0-9]{20,}\\b",
+		flags: "",
+	},
+	// Slack tokens (bot xoxb-, user xoxp-, app-level xoxa-, OAuth xoxo-)
+	{
+		kind: "slack-token",
+		confidence: "high",
+		source: "\\bxox[bpoa]-\\d+-[A-Za-z0-9-]+\\b",
+		flags: "",
+	},
+	// PEM private key header (RSA, EC, DSA, OpenSSH)
+	{
+		kind: "private-key",
+		confidence: "high",
+		source: "-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----",
+		flags: "",
+	},
+	// JSON Web Token: three base64url-encoded segments (header.payload.sig)
+	{
+		kind: "jwt",
+		confidence: "high",
+		source: "\\bey[A-Za-z0-9-_]{10,}\\.[A-Za-z0-9-_]{10,}\\.[A-Za-z0-9-_]{10,}\\b",
+		flags: "",
+	},
+	// Azure Storage connection-string account keys.
+	{
+		kind: "azure-storage-key",
+		confidence: "high",
+		source: "\\bAccountKey=[^;\\s]+",
+		flags: "i",
+	},
+	// Shared Access Signature query-string signatures.
+	{
+		kind: "sas-signature",
+		confidence: "high",
+		source: "[?&]sig=[^&\\s]+",
+		flags: "i",
+	},
+
+	// ── Medium confidence — env-file / config key=value assignment patterns ──
+	// Value must be ≥8 non-whitespace chars; placeholder sigils (${ {{ < null)
+	// are excluded to keep false-positive rates low.
+	// group $1 = key+separator, retained by replaceWith so the key name is
+	// preserved in the redacted output.
+	{
+		kind: "password-assignment",
+		confidence: "medium",
+		source:
+			"(\\bpassw(?:or)?d\\s*[=:]\\s*)" +
+			'(?!["\']?(?:null\\b|undefined\\b|true\\b|false\\b|none\\b|<[^>]{1,40}>|\\$\\{|\\{\\{|%\\{))' +
+			'(?:"[^"\\r\\n]{8,}"|\'[^\'\\r\\n]{8,}\'|[^\\s"\'`=,;{}\\r\\n]{8,})',
+		flags: "i",
+		replaceWith: "$1[REDACTED]",
+	},
+	{
+		kind: "api-key-assignment",
+		confidence: "medium",
+		source:
+			"(\\bapi[_-]?key\\s*[=:]\\s*)" +
+			'(?!["\']?(?:null\\b|undefined\\b|<[^>]{1,40}>|\\$\\{|\\{\\{))' +
+			'(?:"[^"\\r\\n]{8,}"|\'[^\'\\r\\n]{8,}\'|[^\\s"\'`=,;{}\\r\\n]{8,})',
+		flags: "i",
+		replaceWith: "$1[REDACTED]",
+	},
+	{
+		kind: "client-secret-assignment",
+		confidence: "medium",
+		source:
+			"(\\bclient[_-]?secret\\s*[=:]\\s*)" +
+			'(?!["\']?(?:null\\b|undefined\\b|<[^>]{1,40}>|\\$\\{|\\{\\{))' +
+			'(?:"[^"\\r\\n]{8,}"|\'[^\'\\r\\n]{8,}\'|[^\\s"\'`=,;{}\\r\\n]{8,})',
+		flags: "i",
+		replaceWith: "$1[REDACTED]",
+	},
+	{
+		kind: "token-assignment",
+		confidence: "medium",
+		source:
+			"(\\b(?:access|auth|bearer|refresh)[_-]?token\\s*[=:]\\s*)" +
+			'(?!["\']?(?:null\\b|undefined\\b|<[^>]{1,40}>|\\$\\{|\\{\\{))' +
+			'(?:"[^"\\r\\n]{8,}"|\'[^\'\\r\\n]{8,}\'|[^\\s"\'`=,;{}\\r\\n]{8,})',
+		flags: "i",
+		replaceWith: "$1[REDACTED]",
+	},
+];
+
+/**
+ * Scan `text` for likely secrets. Returns metadata only — matched values are
+ * never included in the result, so the output is safe to log or display.
+ *
+ * Results are deduplicated: multiple occurrences of the same kind produce a
+ * single entry so callers receive a clean per-kind summary.
+ */
+export function scanSecrets(text: string): SecretScanResult {
+	const seen = new Set<string>();
+	const matches: SecretMatch[] = [];
+	for (const entry of SECRET_PATTERNS) {
+		const key = `${entry.confidence}:${entry.kind}`;
+		if (seen.has(key)) continue;
+		const re = new RegExp(entry.source, entry.flags);
+		if (re.test(text)) {
+			seen.add(key);
+			matches.push({ kind: entry.kind, confidence: entry.confidence });
+		}
+	}
+	return {
+		matches,
+		hasHigh: matches.some(m => m.confidence === "high"),
+		hasMedium: matches.some(m => m.confidence === "medium"),
+	};
+}
+
+/**
+ * Replace medium-confidence secret values in `text` with `[REDACTED]`,
+ * preserving the key name and separator (e.g. `password = "s3cr3t"` →
+ * `password = [REDACTED]`).
+ *
+ * High-confidence secrets are left untouched — the caller blocks the review
+ * or opts in via `OMP_SECOND_OPINION_ALLOW_SECRETS=1`.
+ */
+export function redactSecrets(text: string): string {
+	let result = text;
+	for (const entry of SECRET_PATTERNS) {
+		if (entry.confidence !== "medium" || !entry.replaceWith) continue;
+		const re = new RegExp(entry.source, entry.flags + "g");
+		result = result.replace(re, entry.replaceWith);
+	}
+	return result;
 }

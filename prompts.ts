@@ -15,10 +15,26 @@ Do this:
 
 Be concise and specific: reference concrete symbols, files, and lines when present.
 
-Finish your review with a final line by itself of the form \`Verdict: X\`, where X is exactly one of SOUND, SOUND_WITH_CAVEATS, or FLAWED:
+End your review with these two lines, each on its own line, in this exact order:
+
+\`Verdict: X\`
+where X is exactly one of SOUND, SOUND_WITH_CAVEATS, or FLAWED:
 - SOUND — no material issues
 - SOUND_WITH_CAVEATS — works, but with caveats worth addressing
-- FLAWED — has a real defect that should block`;
+- FLAWED — has a real defect that should block
+
+\`ReviewMeta: {"verdict":"X","blockingIssues":N,"caveats":N,"confidence":N}\`
+where:
+- \`verdict\` is the exact same token as above (SOUND, SOUND_WITH_CAVEATS, or FLAWED)
+- \`blockingIssues\`: integer count of defects that must be fixed before this work ships (0 for SOUND)
+- \`caveats\`: integer count of non-blocking concerns worth addressing
+- \`confidence\`: your confidence in this verdict, 0–100
+
+Example closing (two final lines only — no extra text after):
+\`\`\`
+Verdict: SOUND_WITH_CAVEATS
+ReviewMeta: {"verdict":"SOUND_WITH_CAVEATS","blockingIssues":0,"caveats":2,"confidence":85}
+\`\`\``;
 
 export const TOOL_DESCRIPTION = `Send the current work to a different model for an independent, adversarial second-opinion review of your findings, plan, or code. Some other tools call this a "rubber duck" review.
 
@@ -26,17 +42,22 @@ export const TOOL_DESCRIPTION = `Send the current work to a different model for 
 - Use before committing to a non-trivial conclusion, when you want a cross-model sanity check, or when the user asks for a second opinion / to "rubber duck" something
 - This is NOT a subagent: it does not run an agent loop or re-derive your work with tools. It is a one-shot review on a deliberately different model — distinct from \`task\`/\`oracle\`, which re-run the agent loop on a same-tier model from an assignment you write
 - By default it reviews BOTH the conversation transcript and your uncommitted \`git diff\` — you do NOT repaste either. Use \`scope\` to narrow to just the chat or just the diff
-- Write a specific \`focus\`, or pick a \`mode\` preset (security/performance/tests/architecture/correctness) to steer the review. Omit both for a general adversarial review
+- Write a specific \`focus\`, or pick a \`mode\` preset (security/performance/tests/architecture/correctness/privacy/api-contract/migration/release) to steer the review. Omit both for a general adversarial review
 - Set \`reviewers\` > 1 to convene a cross-family panel: several different models review independently and their verdicts are aggregated (most-severe wins). Stronger signal, higher cost
 - After a review, call again with \`followup\` to push back or ask the same reviewer to dig deeper — it re-runs on the same model with your prior review plus the new instruction
 - A cross-family reviewer (different model lineage than this session) catches more, because it does not share your blind spots; the tool prefers one by default
 - This forwards your transcript and/or diff (including tool outputs and file contents) to another model, possibly a different vendor. Interactive sessions require consent for each data class before first use
+- Use \`/second-opinion-preview [scope]\` to inspect what would be sent — transcript size, diff stats, consent state, and secret-detection findings — without forwarding anything to a model
+- High-confidence secrets in review material block the request; set \`OMP_SECOND_OPINION_ALLOW_SECRETS=1\` to override. Medium-confidence values (e.g. \`password=…\` assignments) are auto-redacted before sending
 </instruction>
 
 <parameters>
 - \`focus\` (optional): what the reviewer should pressure-test, and the desired output shape
-- \`mode\` (optional): focus preset — \`general\`/\`security\`/\`performance\`/\`tests\`/\`architecture\`/\`correctness\`. Combined with \`focus\` if both are given
+- \`mode\` (optional): focus preset — \`general\`/\`security\`/\`performance\`/\`tests\`/\`architecture\`/\`correctness\`/\`privacy\`/\`api-contract\`/\`migration\`/\`release\`. Combined with \`focus\` if both are given
 - \`scope\` (optional): what to review — \`transcript\`, \`diff\`, or \`both\` (default). \`diff\` reviews your uncommitted git changes
+- \`paths\` (optional): git pathspecs to include in diff scope
+- \`exclude\` (optional): git pathspecs to exclude from diff scope
+- \`preview\` (optional): return material/routing/consent/secret-scan preview without contacting a reviewer
 - \`reviewers\` (optional): number of independent panel reviewers (1–4, default 1). > 1 convenes a cross-family panel with an aggregated verdict
 - \`followup\` (optional): a follow-up instruction that re-runs the previous reviewer on the same work plus its prior review — use to retry or redirect a review
 - \`model\` (optional): explicit reviewer selector ("provider/id", "id", or substring). Bypasses the configured reviewer and the picker
@@ -59,7 +80,11 @@ export type ReviewMode =
 	| "performance"
 	| "tests"
 	| "architecture"
-	| "correctness";
+	| "correctness"
+	| "privacy"
+	| "api-contract"
+	| "migration"
+	| "release";
 
 /** Adversarial focus presets selected via the `mode` parameter. `general` uses DEFAULT_FOCUS. */
 export const FOCUS_PRESETS: Record<Exclude<ReviewMode, "general">, string> = {
@@ -83,4 +108,17 @@ export const FOCUS_PRESETS: Record<Exclude<ReviewMode, "general">, string> = {
 		"Hunt for correctness defects in this work: logic errors, off-by-one and boundary mistakes, faulty state " +
 		"management, race conditions, mishandled errors, and incorrect API/contract usage. Verify the central " +
 		"claims against the evidence shown and flag anything unsupported.",
+	privacy:
+		"Review this work for privacy and data-exposure risks: unintended transcript or diff sharing, secret leakage, " +
+		"unsafe persistence, missing consent boundaries, vendor-routing surprises, and logs or previews that reveal " +
+		"sensitive values. Fail closed where exposure is plausible.",
+	"api-contract":
+		"Review API and contract compatibility: parameter semantics, schema validation, backward/forward compatibility, " +
+		"documented behavior versus implementation, error surfaces, and caller migration risks. Flag silent contract breaks.",
+	migration:
+		"Review this as a migration: old-state handling, clean cutover, rollback hazards, partial-upgrade behavior, " +
+		"data/schema compatibility, and whether legacy paths are intentionally preserved or removed.",
+	release:
+		"Review release readiness: packaging, install/update path, CI coverage, versioning, docs accuracy, operational " +
+		"toggles, failure modes, and whether the change can be confidently shipped and diagnosed.",
 };

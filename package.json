@@ -10,7 +10,8 @@
     "prompts.ts",
     "types.ts",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "scripts/dev-install.ts"
   ],
   "keywords": [
     "oh-my-pi",
@@ -26,6 +27,17 @@
   },
   "bugs": {
     "url": "https://github.com/lurebat/omp-second-opinion/issues"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "build": "bun build ./index.ts --target=node --format=esm --outdir=./.tmp-build",
+    "dev-install": "bun scripts/dev-install.ts"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "bun-types": "latest",
+    "typescript": "latest"
   },
   "omp": {
     "extensions": ["./index.ts"]

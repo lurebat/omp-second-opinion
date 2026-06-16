@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    name: Typecheck / Test / Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # Install devDependencies (bun-types for tsc, test runner deps if any).
+      # No lockfile is required; --no-save keeps the working tree clean.
+      - name: Install dependencies
+        run: bun install
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun test
+
+      - name: Build
+        run: bun run build
+
+      # Confirm the package manifest has the omp.extensions entry that the
+      # runtime plugin loader requires for auto-discovery.
+      - name: Validate package manifest
+        run: |
+          bun -e "
+            const pkg = require('./package.json');
+            const exts = pkg?.omp?.extensions;
+            if (!Array.isArray(exts) || exts.length === 0)
+              throw new Error('package.json is missing a non-empty omp.extensions array');
+            const main = exts[0];
+            if (typeof main !== 'string' || !main.endsWith('.ts'))
+              throw new Error('omp.extensions[0] should be a .ts path, got: ' + main);
+            console.log('omp.extensions OK:', JSON.stringify(exts));
+          "

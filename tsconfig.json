@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "ES2024",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "types": ["bun-types"]
+  },
+  "include": ["*.ts", "scripts/*.ts", "test/*.test.ts"],
+  "exclude": ["node_modules"]
+}

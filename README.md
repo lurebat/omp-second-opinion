@@ -83,6 +83,7 @@ review without starting that follow-up turn.
 ### Commands
 
 - `/second-opinion [focus]` — run a review of the current work and (by default) hand the result to the model.
+- `/second-opinion-preview [focus]` — show the material/routing/consent/secret-scan preview without contacting a reviewer.
 - `/second-opinion-config` — interactively set the saved reviewer, default effort, consent, and auto-hand-off, or reset them.
 - `/second-opinion-last` — re-display the most recent review (it is otherwise ephemeral).
 
@@ -90,16 +91,21 @@ review without starting that follow-up turn.
 
 - **Panel:** `reviewers: 3` convenes three cross-family models that review independently; the verdict is the most severe across the panel, with each reviewer's section shown.
 - **Diff scope:** by default the reviewer also sees your uncommitted `git diff` (staged + unstaged). Use `scope: "diff"` to review only the changes, or `scope: "transcript"` for chat only. Non-git directories silently fall back to the transcript.
+- **Diff filters:** `paths: ["Src/Foo"]` limits reviewed diff paths; `exclude: ["*.lock", "generated/**"]` drops noisy paths.
 - **Follow-up:** after a review, call again with `followup: "…"` to push back or ask the same reviewer to dig deeper — it re-runs the previous reviewer on the same work plus its prior review.
+- **Staleness:** `/second-opinion-last` compares a material hash and reports whether the saved review still matches the current transcript/diff.
 
 ### Tool parameters
 
 | Param | Default | Meaning |
 |---|---|---|
 | `focus` | general adversarial review | What the reviewer should pressure-test |
-| `mode` | `general` | Focus preset: `security`/`performance`/`tests`/`architecture`/`correctness`. Combined with `focus` if both are given |
+| `mode` | `general` | Focus preset: `security`/`performance`/`tests`/`architecture`/`correctness`/`privacy`/`api-contract`/`migration`/`release`. Combined with `focus` if both are given |
 | `scope` | `both` | What to review: `transcript`, `diff` (uncommitted git changes), or `both` |
 | `reviewers` | `1` | Independent panel reviewers (1–4). `>1` runs them concurrently and aggregates verdicts (most-severe wins) |
+| `paths` | all paths | Optional git pathspecs to include in the diff review |
+| `exclude` | none | Optional git pathspecs to exclude from the diff review |
+| `preview` | `false` | Return a no-send preview of material, consent, redaction, and reviewer routing |
 | `followup` | — | Re-run the **previous** reviewer on the same work plus its prior review, steered by this instruction |
 | `model` | configured / auto cross-family | Explicit reviewer selector (`provider/id`, `id`, or substring) |
 | `effort` | inherited / `medium` | Reviewer reasoning effort (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`), clamped to model support. Omitted → the saved default, else the configured selector's `:effort` suffix (e.g. `modelRoles.slow` = `…:xhigh`), else `medium` |
@@ -138,6 +144,7 @@ possibly a different vendor than your session model.
   class before first use; old transcript-only consent does not silently authorize diff sharing.
 - Headless / print / RPC sessions treat transcript-only reviews as consented, but
   require `OMP_SECOND_OPINION_CONSENT=1` before sending a non-empty git diff.
+- High-confidence secret patterns block review by default; medium-confidence assignments are redacted before sending. Set `OMP_SECOND_OPINION_ALLOW_SECRETS=1` only when you intentionally want to override the blocker.
 
 On the first interactive run (and whenever the session/reviewer family changes)
 a **reviewer picker** is offered; the choice is saved as the default and
@@ -151,16 +158,19 @@ same-family picks are flagged as weaker.
 | `OMP_SECOND_OPINION_CONSENT=1` | Pre-grant transcript + diff sharing consent |
 | `OMP_SECOND_OPINION_TIMEOUT_SECONDS` / `OMP_SECOND_OPINION_TIMEOUT_MS` | Reviewer request timeout (default: 180s) |
 | `OMP_SECOND_OPINION_AUTO_HANDOFF=0` | Slash command posts the review without triggering the main model turn (env overrides the `/second-opinion-config` toggle) |
+| `OMP_SECOND_OPINION_ALLOW_SECRETS=1` | Override high-confidence secret blockers; redaction still runs for medium-confidence patterns |
 | `modelRoles.secondopinion` | Native model role read as the configured reviewer when present |
 | `modelRoles.slow` | Used as a fallback reviewer and effort-suffix source |
-| `<agentDir>/second-opinion.json` | Persisted `consented` / `dataConsent` / `reviewer` / `fingerprint` / `defaultEffort` / `autoHandoff` / `lastRun` |
+| `<agentDir>/second-opinion.json` | Persisted `consented` / `dataConsent` / `reviewer` / `fingerprint` / `defaultEffort` / `autoHandoff` / `health` / `lastRun` |
 
 ## Files
 
-- `index.ts` — orchestration: config, reviewer execution, consent/picker, registration
-- `core.ts` — pure logic: transcript rendering, verdict parsing, family/selector/ordering, effort clamp
+- `index.ts` — orchestration: config, reviewer execution, consent/picker, preview, health cache, registration
+- `core.ts` — pure logic: transcript rendering, verdict/meta parsing, family/selector/ordering, redaction, hashes, panel summary, effort clamp
 - `prompts.ts` — reviewer system prompt + tool description
 - `types.ts` — narrow structural types for the injected runtime surface
+- `scripts/dev-install.ts` — development install via junction/symlink with copy fallback
+- `.github/workflows/ci.yml` — typecheck/test/build/package-manifest checks
 
 ## How it differs from the built-in PR
 
@@ -176,10 +186,10 @@ Because an extension only has the public surface, a few internals are emulated:
   replaced) instead of the internal `instrumentedCompleteSimple`; there is no
   oneshot telemetry kind. Verified empirically that the inner reviewer exposes
   no tools and fires zero tool events even when prompted to run a shell command.
-- **The structured verdict is parsed from prose** rather than a forced
-  `submit_review` tool call: `parseVerdict()` accepts only the final standalone
-  `Verdict: …` line as a strong signal, then falls back to a severity-ordered
-  keyword scan when no final verdict line exists.
+- **The structured verdict is parsed from a text trailer** rather than a forced
+  `submit_review` tool call: `parseVerdict()` prefers the final `ReviewMeta: {...}`
+  JSON line, then the final standalone `Verdict: …` line, then falls back to a
+  severity-ordered keyword scan when no strong signal exists.
 - **Effort suffix is honored.** A configured selector like
   `…:minimal` or `…:xhigh` carries its reasoning level through to the reviewer
   (the explicit `effort` param still overrides); it is not silently dropped.
@@ -191,15 +201,17 @@ Because an extension only has the public surface, a few internals are emulated:
   All `getModelRole(...)` reads are guarded so unknown roles never throw on
   older builds.
 
-## Publishing checklist
+## Development and publishing checklist
 
-1. Create a GitHub repository containing the files listed above.
-2. Push a tag, e.g. `v1.0.0`.
-3. Install-test from the tag:
+1. Run `bun install`, `bun run typecheck`, `bun test`, and `bun run build`.
+2. Install locally during development with `bun run dev-install -- --force`; the script prefers a junction/symlink and falls back to copying files.
+3. Create a GitHub repository containing the files listed above.
+4. Push a tag, e.g. `v1.0.0`.
+5. Install-test from the tag:
 
    ```bash
    omp plugin install github:lurebat/omp-second-opinion#v1.0.0
    ```
 
-4. Keep the MIT license file in the repo; the extension adapts MIT-licensed
+6. Keep the MIT license file in the repo; the extension adapts MIT-licensed
    upstream behavior from oh-my-pi PR #1918.
