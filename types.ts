@@ -71,6 +71,18 @@ export interface ExtensionUi {
 	notify(message: string, level?: "info" | "warn" | "error"): void;
 }
 
+/**
+ * The read-only `ctx.models` facade exposed by oh-my-pi builds that landed
+ * #2406 / PR #2575 (`extensions/model-api.ts`). Optional throughout: older
+ * builds omit it and the extension falls back to its own `modelFamily()`.
+ */
+export interface ModelQueryLike {
+	list?(): ModelLike[];
+	current?(): ModelLike | undefined;
+	resolve?(spec: string): ModelLike | undefined;
+	family?(model: ModelLike): string;
+}
+
 /** Handler / tool-execute context passed by the extension runtime. */
 export interface ExtensionContextLike {
 	cwd: string;
@@ -78,6 +90,7 @@ export interface ExtensionContextLike {
 	ui?: ExtensionUi;
 	model?: ModelLike;
 	modelRegistry?: ModelRegistryLike;
+	models?: ModelQueryLike;
 	sessionManager?: SessionManagerLike;
 }
 

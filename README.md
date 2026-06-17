@@ -129,10 +129,13 @@ Saved same-family picker choices are only reused for the session family they wer
 picked for; after the session family changes, they are treated as stale and the
 cross-family default path takes over.
 
-**Family** = the leading series token of the model's canonical id
-(`claude-opus-4.8-1m` → `claude`, `gemini-3-pro-preview` → `gemini`,
-`gpt-5.5` → `gpt`), so point releases and `1m`/mirror variants fold onto one
-lineage. Falls back to the provider when no series token exists.
+**Family** is the native `ctx.models.family()` token when the running oh-my-pi
+build exposes that facade (the catalog-backed vendor lineage exposed by #2406 /
+PR #2575 — `claude-opus-4.8-1m` → `anthropic`, `gpt-5.5` → `openai`, GLM mirrors →
+`glm`), so point releases and namespaced/aggregator mirrors fold onto one lineage.
+On older builds it falls back to the leading series token of the model's canonical
+id (`claude-opus-4.8-1m` → `claude`, `gpt-5.5` → `gpt`), defaulting to the provider
+when no token exists.
 
 ## Privacy & consent
 
@@ -179,8 +182,10 @@ Because an extension only has the public surface, a few internals are emulated:
 - **No native `secondopinion` role / `priority.json`** — the role is read if the
   user set one, but resolution is structural (cross-family-by-default) and lives
   in `core.ts`.
-- **`getModelSeries` is re-implemented** locally as `modelFamily()` over the
-  canonical id from `modelRegistry.getCanonicalId()`.
+- **`getModelSeries` is adopted via the public `ctx.models.family()` facade when
+  available** — the catalog-backed family token exposed by #2406 / PR #2575 is
+  preferred for the cross-family check, falling back to a local `modelFamily()` over
+  `modelRegistry.getCanonicalId()` on builds without the facade.
 - **One-shot completion uses `createAgentSession`** (a tool-less, in-memory
   ephemeral session, MCP/LSP/extension-discovery disabled, system prompt
   replaced) instead of the internal `instrumentedCompleteSimple`; there is no

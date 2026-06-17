@@ -120,6 +120,27 @@ function safeRole(pi: ExtensionApi, role: string): string | undefined {
 	}
 }
 
+/**
+ * Family classifier for the current runtime. Prefers the native `ctx.models.family()`
+ * facade (oh-my-pi builds that landed #2406 / PR #2575) — a catalog-backed vendor
+ * lineage token that folds mirrors/proxies/point-releases onto one family, the robust
+ * definition #1912 insisted on — and falls back to the local series heuristic on older
+ * builds (and when the facade can't classify an id and returns "").
+ */
+function makeFamilyOf(ctx: ExtensionContextLike): (model: ModelLike) => string {
+	const native = ctx.models?.family;
+	const registry = ctx.modelRegistry;
+	const local = (model: ModelLike): string => modelFamily(model, registry?.getCanonicalId(model));
+	if (!native) return local;
+	return (model: ModelLike): string => {
+		try {
+			return native(model) || local(model);
+		} catch {
+			return local(model);
+		}
+	};
+}
+
 function agentDir(pi: ExtensionApi): string {
 	const fromSettings = pi.pi.Settings?.instance?.getAgentDir?.();
 	if (fromSettings) return fromSettings;
@@ -216,6 +237,7 @@ export const __testing = {
 	grantDataConsent,
 	hasDataConsent,
 	hasFullDataConsent,
+	makeFamilyOf,
 	redactSecrets,
 	scanSecrets,
 	setFullDataConsent,
@@ -516,9 +538,7 @@ async function planReviewers(
 	available: ModelLike[],
 	explicitSelector: string | undefined,
 ): Promise<ResolvedPlan> {
-	const registry = ctx.modelRegistry;
-	const familyOf = (model: ModelLike): string =>
-		modelFamily(model, registry?.getCanonicalId(model));
+	const familyOf = makeFamilyOf(ctx);
 	const sessionModel = ctx.model;
 	const sessionFamily = sessionModel ? familyOf(sessionModel) : undefined;
 
@@ -741,7 +761,7 @@ async function runSecondOpinion(
 			(redactionFindings.length === 0 ? "." : `; redactions: ${redactions}.`),
 	);
 
-	const familyOf = (model: ModelLike): string => modelFamily(model, registry.getCanonicalId(model));
+	const familyOf = makeFamilyOf(ctx);
 	const sessionModel = ctx.model;
 	const sessionFamily = sessionModel ? familyOf(sessionModel) : undefined;
 	const saved = loadState(pi);
@@ -1152,7 +1172,7 @@ export default function secondOpinionExtension(pi: ExtensionApi): void {
 						ui.notify("No authenticated models available.", "warn");
 						continue;
 					}
-					const familyOf = (m: ModelLike): string => modelFamily(m, registry?.getCanonicalId(m));
+					const familyOf = makeFamilyOf(ctx);
 					const current = state.reviewer ? resolveSelector(state.reviewer, available) : undefined;
 					const picked = await runPicker(ctx, available, current, ctx.model, familyOf);
 					if (picked) {
