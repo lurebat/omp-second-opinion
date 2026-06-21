@@ -431,6 +431,19 @@ describe("orderCandidates", () => {
 		expect(result[0]?.id).toBe("gpt-4o");
 	});
 
+	test("configured session model is honored instead of falling through to same-family sibling", () => {
+		const claudeHaiku = mkModel("claude-haiku-4", "anthropic");
+		const result = orderCandidates({
+			available: [CLAUDE_OPUS, claudeHaiku, GPT4O],
+			sessionModel: CLAUDE_OPUS,
+			sessionFamily: "claude",
+			familyOf: simpleFamily,
+			configured: CLAUDE_OPUS,
+			slow: undefined,
+		});
+		expect(result[0]?.id).toBe("claude-opus-4");
+	});
+
 	test("cross-family slow model appears before same-family models", () => {
 		const result = orderCandidates({
 			available,

@@ -402,6 +402,7 @@ export function orderCandidates(args: {
 	const { available, sessionModel, sessionFamily, familyOf, configured, slow } = args;
 	const sessionLabel = sessionModel ? formatModel(sessionModel) : undefined;
 	const sessionProvider = sessionModel?.provider.toLowerCase();
+	const configuredLabel = configured ? formatModel(configured) : undefined;
 
 	const crossFamily = available.filter(m => !sessionFamily || familyOf(m) !== sessionFamily);
 	const crossSameProvider = crossFamily.filter(m => m.provider.toLowerCase() === sessionProvider);
@@ -421,7 +422,7 @@ export function orderCandidates(args: {
 	for (const model of ordered) {
 		if (!model) continue;
 		const label = formatModel(model);
-		if (label === sessionLabel) continue;
+		if (label === sessionLabel && label !== configuredLabel) continue;
 		if (seen.has(label)) continue;
 		seen.add(label);
 		result.push(model);
